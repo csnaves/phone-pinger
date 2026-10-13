@@ -1,0 +1,17 @@
+# Live Apple session tokens -- grants account access without password/2FA. Never commit.
+icloud_cookies/
+
+# Local environment and runtime output
+venv/
+logs/
+__pycache__/
+*.pyc
+
+# Per-machine Claude Code settings
+.claude/settings.local.json
+
+# Secrets, if ever moved out of env vars
+.env
+
+# Local-only scratch scripts
+test.py
