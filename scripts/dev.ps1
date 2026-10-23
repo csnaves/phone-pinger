@@ -1,9 +1,9 @@
 # Run a dev instance of the locator against a separate iCloud account.
 #
-#   powershell -ExecutionPolicy Bypass -File .\dev.ps1 [-Port 8001] [-EnvFile dev.env]
+#   powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1 [-Port 8001] [-EnvFile dev.env]
 #
 # Reads ICLOUD_EMAIL, ICLOUD_PASSWORD, ICLOUD_DEVICE_ID and LOCATOR_TOKEN from the
-# env file (copy dev.env.example). The machine-wide production values are always
+# env file (copy dev.env.example; relative paths are from the repo root). The machine-wide production values are always
 # present in new shells, so this refuses to start if any value is missing, still a
 # placeholder, or matches production. Binds to 127.0.0.1 only and auto-reloads on
 # code changes. The shell's environment is restored on exit.
@@ -13,7 +13,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
+Set-Location (Split-Path $PSScriptRoot -Parent)
 
 $Required = "ICLOUD_EMAIL", "ICLOUD_PASSWORD", "ICLOUD_DEVICE_ID", "LOCATOR_TOKEN"
 
@@ -55,7 +55,7 @@ try {
     Write-Host "Dev instance for $($values['ICLOUD_EMAIL']) on port $Port" -ForegroundColor Cyan
     Write-Host "  2FA page: http://localhost:$Port/icloud?token=$($values['LOCATOR_TOKEN'])"
     Write-Host "  Ping:     curl.exe -X POST -H `"Authorization: Bearer <token>`" http://localhost:$Port/ping"
-    & .\venv\Scripts\python.exe -m uvicorn locator:app --host 127.0.0.1 --port $Port --reload
+    & .\venv\Scripts\python.exe -m uvicorn phone_pinger.main:app --host 127.0.0.1 --port $Port --reload
 }
 finally {
     foreach ($key in $Required) { [Environment]::SetEnvironmentVariable($key, $saved[$key], "Process") }

@@ -1,6 +1,6 @@
 """List the devices on an iCloud account with their IDs, for ICLOUD_DEVICE_ID.
 
-    .\\venv\\Scripts\\python find_devices.py
+    .\\venv\\Scripts\\python scripts\\find_devices.py
 
 Credentials come from EMAIL / PASSWORD below if filled in, otherwise from a prompt.
 It deliberately ignores the ICLOUD_* env vars: they're set machine-wide for the
@@ -22,7 +22,8 @@ from pyicloud.exceptions import PyiCloudFailedLoginException
 EMAIL = ""
 PASSWORD = ""
 
-COOKIE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icloud_cookies")
+# Repo root, not scripts/, so the session lands next to the service's sessions.
+COOKIE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "icloud_cookies")
 
 
 def login() -> PyiCloudService:
