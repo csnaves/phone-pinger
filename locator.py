@@ -4,10 +4,12 @@ sys.stderr.reconfigure(encoding="utf-8")
 
 from pyicloud import PyiCloudService
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import uvicorn
+import pages
 from datetime import datetime, timedelta
+import hmac
 import logging
 import os
 import threading
@@ -41,6 +43,12 @@ os.makedirs(COOKIE_DIR, exist_ok=True)
 # only changes if the phone is wiped and re-added to the account.
 DEVICE_ID = os.environ["ICLOUD_DEVICE_ID"]
 MIN_RESEND_INTERVAL = timedelta(seconds=30)
+
+# Shared secret required on every endpoint. Sent as "Authorization: Bearer <token>"
+# or ?token=<token>; the /icloud UI swaps the query param for a cookie.
+API_TOKEN = os.environ["LOCATOR_TOKEN"]
+TOKEN_COOKIE = "locator_token"
+TOKEN_COOKIE_MAX_AGE = 30 * 24 * 3600
 
 log.info(f"Using cookie dir: {COOKIE_DIR}")
 
@@ -131,7 +139,31 @@ with state_lock:
 # ----------------------
 # FastAPI app
 # ----------------------
-app = FastAPI()
+# No /docs, /redoc or /openapi.json: they'd expose a "Try it out" button for /ping.
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+
+def _check_token(request: Request, allow_cookie: bool) -> None:
+    auth = request.headers.get("authorization", "")
+    supplied = (
+        (auth[len("Bearer "):] if auth.startswith("Bearer ") else "")
+        or request.query_params.get("token", "")
+        or (request.cookies.get(TOKEN_COOKIE, "") if allow_cookie else "")
+    )
+    # 403, not 401: /ping's 401 already means "iCloud needs re-auth".
+    if not hmac.compare_digest(supplied.encode(), API_TOKEN.encode()):
+        raise HTTPException(status_code=403, detail="Invalid or missing token.")
+
+
+def require_token(request: Request) -> None:
+    """Header, query param, or the /icloud UI's cookie. The cookie is SameSite=Lax,
+    so browsers only attach it to cross-site requests on top-level GETs."""
+    _check_token(request, allow_cookie=True)
+
+
+def require_url_token(request: Request) -> None:
+    """For GET /ping: no cookie, so a link click or prefetch can't ring the phone."""
+    _check_token(request, allow_cookie=False)
 
 
 @app.middleware("http")
@@ -151,99 +183,65 @@ async def log_requests(request: Request, call_next):
     return response
 
 
-def render_page(content: str, status_msg: str = "") -> str:
+def auth_state() -> str:
+    """Banner state for pages.*. Read while holding state_lock."""
     if api is None:
-        banner_text = "⚠️ Not Connected"
-        banner_color = "#F44336"
-    elif device is None or api.requires_2fa:
-        banner_text = "⚠️ MFA Required"
-        banner_color = "#FF9800"
-    else:
-        banner_text = "✅ Authenticated"
-        banner_color = "#4CAF50"
-
-    status_html = f'<div class="status">{status_msg}</div>' if status_msg else ""
-
-    return f"""
-    <html>
-      <head>
-        <title>iCloud Control</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <style>
-          body {{ font-family: system-ui; text-align: center; margin-top: 40px; background: #111; color: white; }}
-          .banner {{ background-color: {banner_color}; padding: 12px; border-radius: 8px; margin-bottom: 16px; font-size: 18px; }}
-          .status {{ background: #222; padding: 10px; border-radius: 6px; margin-bottom: 20px; color: #ccc; font-size: 14px; }}
-          input {{ padding: 10px; font-size: 18px; text-align: center; border-radius: 6px; border: none; }}
-          button {{ padding: 10px; font-size: 16px; border-radius: 6px; border: none; background: #4f8cff; color: white; margin-top: 12px; cursor: pointer; }}
-          form {{ margin: 8px; }}
-          a {{ color: #4f8cff; }}
-        </style>
-      </head>
-      <body>
-        <div class="banner">{banner_text}</div>
-        {status_html}
-        {content}
-      </body>
-    </html>
-    """
-
-
-def render_2fa_form(status_msg: str = "") -> str:
-    return render_page("""
-        <h2>iCloud Verification Required</h2>
-        <p>A code should be on your trusted Apple devices.</p>
-        <form method="post" action="/icloud">
-          <input name="code" type="text" inputmode="numeric" maxlength="6" placeholder="6-digit code" required autofocus />
-          <br>
-          <button type="submit">Verify</button>
-        </form>
-        <form method="post" action="/icloud/resend">
-          <button type="submit">Resend Code</button>
-        </form>
-    """, status_msg=status_msg)
+        return "disconnected"
+    if device is None or api.requires_2fa:
+        return "mfa_required"
+    return "authenticated"
 
 
 # ----------------------
 # /icloud — verification UI
 # ----------------------
-@app.get("/icloud", response_class=HTMLResponse)
-def icloud_ui():
+@app.get("/icloud", response_class=HTMLResponse, dependencies=[Depends(require_token)])
+def icloud_ui(request: Request):
+    if "token" in request.query_params:
+        # Move the token into a cookie so it doesn't sit in the URL bar and history,
+        # and so the page's forms authenticate.
+        response = RedirectResponse("/icloud", status_code=303)
+        response.set_cookie(
+            TOKEN_COOKIE, API_TOKEN, max_age=TOKEN_COOKIE_MAX_AGE, httponly=True, samesite="lax"
+        )
+        return response
+
+    # Fixed strings only: the query param picks a message, it's never echoed.
+    ping_msg = pages.PING_RESULTS.get(request.query_params.get("ping", ""), "")
+
     with state_lock:
         if api is None or device is None:
             init_api()
 
         if api is None:
-            return render_page(
-                f"<h2>⚠️ Cannot connect to iCloud</h2><p>{last_error}</p>"
-                "<form method='post' action='/icloud/resend'><button type='submit'>Try Again</button></form>"
-            )
+            return pages.cannot_connect(auth_state(), last_error, retry=True)
 
         if not api.requires_2fa and device is not None:
-            return render_page("<h2>✅ No verification needed.</h2><p><a href='/ping'>Try /ping</a></p>")
+            return pages.already_authenticated(auth_state(), status_msg=ping_msg)
 
         # 2FA required: auto-send a code (rate-limited so refreshes don't spam Apple)
         _, msg = send_code(force=False)
-        return render_2fa_form(status_msg=msg)
+        return pages.verify_form(auth_state(), status_msg=" ".join(filter(None, [ping_msg, msg])))
 
 
-@app.post("/icloud", response_class=HTMLResponse)
+@app.post("/icloud", response_class=HTMLResponse, dependencies=[Depends(require_token)])
 def submit_code(code: str = Form(...)):
     global code_sent_at
     with state_lock:
         if api is None:
-            return render_page(f"<h2>⚠️ Not connected.</h2><p>{last_error}</p>")
+            return pages.cannot_connect(auth_state(), last_error)
 
         if not api.requires_2fa:
             _refresh_device()
-            return render_page("<h2>ℹ️ No verification needed.</h2>")
+            return pages.already_authenticated(auth_state())
 
         try:
             success = api.validate_2fa_code(code)
         except Exception as e:
-            return render_page(f"<h2>❌ Verification error</h2><p>{e}</p><p><a href='/icloud'>Try again</a></p>")
+            return pages.verify_error(auth_state(), e)
 
         if not success:
-            return render_2fa_form(status_msg="❌ Invalid code. Try again or resend.")
+            return pages.verify_form(auth_state(), status_msg="❌ Invalid code. Try again or resend.")
 
         if not api.is_trusted_session:
             try:
@@ -253,35 +251,48 @@ def submit_code(code: str = Form(...)):
 
         code_sent_at = None
         _refresh_device()
-        return render_page("<h2>✅ Code accepted</h2><p>Session restored. <a href='/ping'>Try /ping</a></p>")
+        return pages.code_accepted(auth_state())
 
 
 # ----------------------
 # /icloud/resend — manual recovery: re-init + force-send code
 # ----------------------
-@app.post("/icloud/resend", response_class=HTMLResponse)
+@app.post("/icloud/resend", response_class=HTMLResponse, dependencies=[Depends(require_token)])
 def resend_code():
     with state_lock:
         # Always re-init so we pick up the true current auth state
         init_api()
 
         if api is None:
-            return render_page(f"<h2>⚠️ Cannot connect to iCloud</h2><p>{last_error}</p>")
+            return pages.cannot_connect(auth_state(), last_error)
 
         if not api.requires_2fa:
-            return render_page("<h2>✅ Session is already authenticated.</h2><p><a href='/ping'>Try /ping</a></p>")
+            return pages.already_authenticated(auth_state())
 
         ok, msg = send_code(force=True)
         if not ok:
-            return render_page(f"<h2>⚠️ {msg}</h2>")
-        return render_2fa_form(status_msg=msg)
+            return pages.send_failed(auth_state(), msg)
+        return pages.verify_form(auth_state(), status_msg=msg)
+
+
+# ----------------------
+# /icloud/ping — the page's "Ping phone" button
+# Redirects back to /icloud with the result (post/redirect/get), so refreshing
+# the page shows the status again instead of re-sending the ping.
+# ----------------------
+@app.post("/icloud/ping", dependencies=[Depends(require_token)])
+def ping_from_page():
+    result = "sent" if play_sound() else "failed"
+    return RedirectResponse(f"/icloud?ping={result}", status_code=303)
 
 
 # ----------------------
 # /ping — trigger sound on the device
+# POST for Shortcuts/curl and the /icloud page. GET only for the Shelly button,
+# which can't send POST, and only with ?token= (see require_url_token).
 # ----------------------
-@app.get("/ping")
-def ping_phone():
+def play_sound() -> bool:
+    """Ring the target device. Returns False if iCloud needs re-authentication."""
     global device
     if device is None:
         # Startup init can fail if the network isn't up yet after a cold boot.
@@ -290,6 +301,23 @@ def ping_phone():
             if device is None:
                 init_api()
     if device is None:
+        return False
+
+    try:
+        device.play_sound()
+    except (PyiCloudAPIResponseException, PyiCloudFailedLoginException) as e:
+        log.warning(f"⚠️ Ping failed (auth issue): {e}")
+        with state_lock:
+            device = None  # mark stale; next /icloud visit will re-init
+        return False
+
+    log.info("📱 Ping sent")
+    return True
+
+
+@app.post("/ping", dependencies=[Depends(require_token)])
+def ping_phone():
+    if not play_sound():
         return JSONResponse(
             status_code=401,
             headers={"Location": "/icloud"},
@@ -299,25 +327,12 @@ def ping_phone():
                 "redirect": "/icloud",
             },
         )
-
-    try:
-        device.play_sound()
-    except (PyiCloudAPIResponseException, PyiCloudFailedLoginException) as e:
-        log.warning(f"⚠️ Ping failed (auth issue): {e}")
-        with state_lock:
-            device = None  # mark stale; next /icloud visit will re-init
-        return JSONResponse(
-            status_code=401,
-            headers={"Location": "/icloud"},
-            content={
-                "error": "iCloud authentication required.",
-                "message": "Visit /icloud to fix authentication.",
-                "redirect": "/icloud",
-            },
-        )
-
-    log.info("📱 Ping sent")
     return {"status": "Ping sent to iPhone"}
+
+
+@app.get("/ping", dependencies=[Depends(require_url_token)])
+def ping_phone_get():
+    return ping_phone()
 
 
 # ----------------------
