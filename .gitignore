@@ -12,6 +12,7 @@ __pycache__/
 
 # Secrets, if ever moved out of env vars
 .env
+dev.env
 
 # Local-only scratch scripts
 test.py

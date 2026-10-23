@@ -1,6 +1,6 @@
 # Remote dev + always-on service setup
 
-This document covers configuring the Intel NUC so `locator.py` runs on boot and can be edited/debugged remotely without being physically logged in.
+This document covers configuring the Intel NUC so the `phone_pinger` app runs on boot and can be edited/debugged remotely without being physically logged in.
 
 The stack:
 - **NSSM** — wraps `uvicorn` as a Windows service that starts on boot and survives logout.
@@ -16,9 +16,12 @@ The stack:
 setx /M ICLOUD_EMAIL "your@email.com"
 setx /M ICLOUD_PASSWORD "yourpassword"
 setx /M ICLOUD_DEVICE_ID "<target-device-id>"
+setx /M LOCATOR_TOKEN "<random-token>"
 ```
 
 `ICLOUD_DEVICE_ID` is the target phone's iCloud device id. To find it, list the account's devices and copy the right one's `_content["id"]` (see README).
+
+`LOCATOR_TOKEN` is the shared secret every endpoint requires. Generate one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. The service won't start without it.
 
 Stored in the registry at `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`. Any admin on the box can read them — fine for a home NUC.
 
@@ -37,16 +40,17 @@ mkdir %USERPROFILE%\personal_workspace\logs
 
 C:\tools\nssm.exe install LocatorService ^
   "%USERPROFILE%\personal_workspace\venv\Scripts\python.exe" ^
-  "-m uvicorn locator:app --host 0.0.0.0 --port 8000"
+  "-m uvicorn phone_pinger.main:app --host 0.0.0.0 --port 8000"
 
 C:\tools\nssm.exe set LocatorService AppDirectory "%USERPROFILE%\personal_workspace"
 C:\tools\nssm.exe set LocatorService AppStdout   "%USERPROFILE%\personal_workspace\logs\locator.out.log"
 C:\tools\nssm.exe set LocatorService AppStderr   "%USERPROFILE%\personal_workspace\logs\locator.err.log"
 C:\tools\nssm.exe set LocatorService Start       SERVICE_AUTO_START
 
-:: Services only see machine env vars from boot time, so pass the device id directly.
-:: PYTHONUNBUFFERED makes print() output reach the log file immediately.
-C:\tools\nssm.exe set LocatorService AppEnvironmentExtra "ICLOUD_DEVICE_ID=<target-device-id>" "PYTHONUNBUFFERED=1"
+:: Services only see machine env vars from boot time, so pass the device id and token directly.
+:: This replaces the whole list, so always include every variable.
+:: PYTHONUNBUFFERED makes log output reach the log file immediately.
+C:\tools\nssm.exe set LocatorService AppEnvironmentExtra "ICLOUD_DEVICE_ID=<target-device-id>" "LOCATOR_TOKEN=<random-token>" "PYTHONUNBUFFERED=1"
 
 :: Run as your user so file ACLs on venv\ and icloud_cookies\ work
 C:\tools\nssm.exe set LocatorService ObjectName ".\<windows-user>" "<your-windows-password>"
@@ -61,7 +65,14 @@ Live-tail the log (cmd has no native tail; shell out to PowerShell for this one)
 powershell -NoProfile -Command "Get-Content %USERPROFILE%\personal_workspace\logs\locator.out.log -Tail 50 -Wait"
 ```
 
-First boot will require 2FA. Hit `/icloud` from any machine on your LAN (or over Tailscale once that's set up) to enter the code. Cookies persist to `icloud_cookies\` so this won't re-prompt until Apple invalidates the session.
+First boot will require 2FA. Hit `/icloud?token=<token>` from any machine on your LAN (or over Tailscale once that's set up) to enter the code. Cookies persist to `icloud_cookies\` so this won't re-prompt until Apple invalidates the session.
+
+**Upgrading a service installed before the `phone_pinger` package** (it ran `locator:app`): point it at the new module, make sure `LOCATOR_TOKEN` is in `AppEnvironmentExtra` (above), then restart:
+
+```cmd
+C:\tools\nssm.exe set LocatorService AppParameters "-m uvicorn phone_pinger.main:app --host 0.0.0.0 --port 8000"
+net stop LocatorService & net start LocatorService
+```
 
 ### Service lifecycle commands
 
@@ -140,14 +151,14 @@ Host nuc
 
 ```cmd
 :: From the laptop, over Tailscale
-curl http://nuc.<tailnet>.ts.net:8000/ping
+curl -X POST -H "Authorization: Bearer <token>" http://nuc.<tailnet>.ts.net:8000/ping
 ```
 
 Expected: `{"status":"Ping sent to iPhone"}` and the phone rings.
 
 ## 7. The remote-dev loop
 
-Edit `locator.py` in VS Code (changes write directly to the NUC). Then from your SSH session or VS Code integrated terminal on the NUC:
+Edit the code in `phone_pinger/` in VS Code (changes write directly to the NUC). Then from your SSH session or VS Code integrated terminal on the NUC:
 
 ```cmd
 net stop LocatorService && net start LocatorService
@@ -162,14 +173,15 @@ You can also run `claude` directly in the SSH session — Claude Code on the NUC
 
 | Task | How |
 |------|-----|
-| Ping the phone | `http://nuc.<tailnet>.ts.net:8000/ping` with Tailscale connected. **`http`, not `https`** — uvicorn serves plain HTTP (Tailscale already encrypts the traffic). |
-| Re-authenticate with Apple | `/ping` returns 401 → open `http://nuc.<tailnet>.ts.net:8000/icloud` and enter the code. It goes to the account's trusted devices (possibly the target phone itself). |
-| Deploy a code change | Edit over Remote-SSH, then in an elevated cmd: `net stop LocatorService && net start LocatorService`. Python only reads `locator.py` at startup — changes don't apply until restart. |
-| Watch logs | `locator.err.log` has uvicorn startup + request lines; `locator.out.log` has the app's own `print()` output (init, target device, pings). |
+| Ping the phone | `POST http://nuc.<tailnet>.ts.net:8000/ping` with `Authorization: Bearer <token>`, Tailscale connected. **`http`, not `https`** — uvicorn serves plain HTTP (Tailscale already encrypts the traffic). |
+| Re-authenticate with Apple | `/ping` returns 401 → open `http://nuc.<tailnet>.ts.net:8000/icloud?token=<token>` and enter the code. It goes to the account's trusted devices (possibly the target phone itself). The browser keeps the token in a cookie for 30 days, so later visits can use plain `/icloud`. |
+| Deploy a code change | Edit over Remote-SSH, then in an elevated cmd: `net stop LocatorService && net start LocatorService`. Python only reads the code at startup — changes don't apply until restart. |
+| Watch logs | `locator.out.log` has the app's timestamped output: each request (IP, status, duration, User-Agent), init, target device, pings. `locator.err.log` has uvicorn startup/shutdown and tracebacks. |
+| Rotate the token | Update `LOCATOR_TOKEN` in both places (`setx /M` and `nssm set ... AppEnvironmentExtra`), restart the service, then update the Shelly URL and any Shortcuts. |
 
 ### Gotchas
 
-- **Don't run `locator.py` manually while the service is running.** Both try to bind port 8000; the loser crash-loops with `[Errno 10048] ... only one usage of each socket address`. `net stop LocatorService` first, or use a different port for manual testing.
+- **Don't run the app manually on port 8000 while the service is running.** Both try to bind port 8000; the loser crash-loops with `[Errno 10048] ... only one usage of each socket address`. `net stop LocatorService` first, or use a different port for manual testing.
 - **`https://` won't work.** Use `http://`.
 - **Garbled emoji in logs (`ðŸŽ¯`)** is just PowerShell 5.1 misreading UTF-8. Add `-Encoding UTF8` to `Get-Content`.
 - **Cold boot timing:** the service can start before the network is up, so the startup iCloud login fails. `/ping` retries the login itself, so the first ping after a reboot still works. Verified with a pull-the-plug test.
@@ -204,8 +216,7 @@ Test by using your phone on cellular (Wi-Fi off, Tailscale on).
   C:\tools\nssm.exe set LocatorService AppRotateFiles 1
   C:\tools\nssm.exe set LocatorService AppRotateBytes 1048576
   ```
-- **One-tap button:** iOS Shortcut → "Get contents of URL" → `http://nuc.<tailnet>.ts.net:8000/ping`. Requires Tailscale on the phone.
-- **No auth on the endpoint:** anyone on your home LAN or tailnet can trigger a ping. Fine for home use.
+- **One-tap button:** iOS Shortcut → "Get contents of URL" → `http://nuc.<tailnet>.ts.net:8000/ping`, Method **POST**, header `Authorization: Bearer <token>`. Requires Tailscale on the phone.
 
 ## Pitfalls
 
