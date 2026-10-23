@@ -4,12 +4,32 @@ sys.stderr.reconfigure(encoding="utf-8")
 
 from pyicloud import PyiCloudService
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 from datetime import datetime, timedelta
+import logging
 import os
 import threading
+import time
+
+# ----------------------
+# Logging
+# ----------------------
+LOG_FORMAT = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
+
+log = logging.getLogger("locator")
+log.setLevel(logging.INFO)
+log.propagate = False
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(LOG_FORMAT)
+log.addHandler(_log_handler)
+
+# The uvicorn CLI configures its loggers before importing this module, so restamp
+# its startup/shutdown/error output and drop its access log in favor of log_requests.
+for _h in logging.getLogger("uvicorn").handlers:
+    _h.setFormatter(LOG_FORMAT)
+logging.getLogger("uvicorn.access").disabled = True
 
 # ----------------------
 # Configuration
@@ -22,7 +42,7 @@ os.makedirs(COOKIE_DIR, exist_ok=True)
 DEVICE_ID = os.environ["ICLOUD_DEVICE_ID"]
 MIN_RESEND_INTERVAL = timedelta(seconds=30)
 
-print("Using cookie dir:", COOKIE_DIR)
+log.info(f"Using cookie dir: {COOKIE_DIR}")
 
 # ----------------------
 # Module state (mutate only while holding state_lock)
@@ -42,15 +62,15 @@ def _refresh_device() -> None:
     try:
         match = next((d for d in api.devices if d._content.get("id") == DEVICE_ID), None)
         if match is None:
-            print(f"⚠️ No device with id {DEVICE_ID[:12]}... in account")
+            log.warning(f"⚠️ No device with id {DEVICE_ID[:12]}... in account")
             device = None
             return
         device = match
         name = match._content.get("name", "?")
         model = match._content.get("deviceDisplayName", "?")
-        print(f"🎯 Target device: {name} ({model})")
+        log.info(f"🎯 Target device: {name} ({model})")
     except Exception as e:
-        print(f"⚠️ Could not resolve device: {e}")
+        log.warning(f"⚠️ Could not resolve device: {e}")
         device = None
 
 
@@ -67,12 +87,12 @@ def init_api() -> None:
         last_error = None
         code_sent_at = None
         _refresh_device()
-        print(f"✅ iCloud client initialized (requires_2fa={api.requires_2fa})")
+        log.info(f"✅ iCloud client initialized (requires_2fa={api.requires_2fa})")
     except Exception as e:
         api = None
         device = None
         last_error = f"{type(e).__name__}: {e}"
-        print(f"⚠️ iCloud init failed: {last_error}")
+        log.warning(f"⚠️ iCloud init failed: {last_error}")
 
 
 def send_code(force: bool = False) -> "tuple[bool, str]":
@@ -98,7 +118,7 @@ def send_code(force: bool = False) -> "tuple[bool, str]":
 
     code_sent_at = datetime.now()
     method = getattr(api, "two_factor_delivery_method", "trusted_device")
-    print(f"📲 2FA code sent via {method} at {code_sent_at}")
+    log.info(f"📲 2FA code sent via {method}")
     return True, f"Code sent via {method}."
 
 
@@ -112,6 +132,23 @@ with state_lock:
 # FastAPI app
 # ----------------------
 app = FastAPI()
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    # Logged on completion even if the client hung up, unlike uvicorn's access log.
+    # Path only (no query string) so future tokens don't land in the log.
+    start = time.perf_counter()
+    client = request.client.host if request.client else "?"
+    ua = request.headers.get("user-agent", "-")
+    try:
+        response = await call_next(request)
+    except Exception:
+        log.exception(f'{client} "{request.method} {request.url.path}" failed ua="{ua}"')
+        raise
+    ms = (time.perf_counter() - start) * 1000
+    log.info(f'{client} "{request.method} {request.url.path}" {response.status_code} {ms:.0f}ms ua="{ua}"')
+    return response
 
 
 def render_page(content: str, status_msg: str = "") -> str:
@@ -212,7 +249,7 @@ def submit_code(code: str = Form(...)):
             try:
                 api.trust_session()
             except Exception as e:
-                print(f"⚠️ trust_session failed: {e}")
+                log.warning(f"⚠️ trust_session failed: {e}")
 
         code_sent_at = None
         _refresh_device()
@@ -266,7 +303,7 @@ def ping_phone():
     try:
         device.play_sound()
     except (PyiCloudAPIResponseException, PyiCloudFailedLoginException) as e:
-        print(f"⚠️ Ping failed (auth issue): {e}")
+        log.warning(f"⚠️ Ping failed (auth issue): {e}")
         with state_lock:
             device = None  # mark stale; next /icloud visit will re-init
         return JSONResponse(
@@ -279,7 +316,7 @@ def ping_phone():
             },
         )
 
-    print(f"📱 Ping sent at {datetime.now()}")
+    log.info("📱 Ping sent")
     return {"status": "Ping sent to iPhone"}
 
 
@@ -287,4 +324,4 @@ def ping_phone():
 # App runner
 # ----------------------
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False)
