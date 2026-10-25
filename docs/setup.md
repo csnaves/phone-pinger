@@ -65,6 +65,20 @@ Live-tail the log (cmd has no native tail; shell out to PowerShell for this one)
 powershell -NoProfile -Command "Get-Content %USERPROFILE%\personal_workspace\logs\locator.out.log -Tail 50 -Wait"
 ```
 
+### Firewall: open port 8000 to the LAN and Tailscale only
+
+```cmd
+netsh advfirewall firewall add rule name="Phone Pinger (TCP 8000)" dir=in action=allow protocol=TCP localport=8000 profile=private,public remoteip=localsubnet,100.64.0.0/10,fd7a:115c:a1e0::/48
+```
+
+- `localsubnet` is the home Wi-Fi (the Shelly button and home devices). `100.64.0.0/10` and `fd7a:115c:a1e0::/48` are Tailscale's address ranges.
+- `profile=private,public` covers both adapters: the NUC's Wi-Fi is on the **Public** profile and Tailscale is **Private**. Leave the Wi-Fi on Public: switching it to Private would also expose SSH to the whole Wi-Fi (see step 3).
+- **When Windows pops up "Allow Python to communicate on these networks?", click Cancel.** Clicking Allow creates a rule that lets *every* Python program accept connections on *any* port from *any* address. The rule above already covers the service. If one was created by accident, delete it:
+  ```cmd
+  netsh advfirewall firewall delete rule name="python.exe" dir=in
+  ```
+- Windows doesn't firewall a machine's connections to itself, so test from another device, not from the NUC.
+
 First boot will require 2FA. Hit `/icloud?token=<token>` from any machine on your LAN (or over Tailscale once that's set up) to enter the code. Cookies persist to `icloud_cookies\` so this won't re-prompt until Apple invalidates the session.
 
 **Upgrading a service installed before the `phone_pinger` package** (it ran `locator:app`): point it at the new module, make sure `LOCATOR_TOKEN` is in `AppEnvironmentExtra` (above), then restart:
@@ -99,11 +113,13 @@ sc config sshd start= auto
 :: Make PowerShell (not cmd) the default shell over SSH -- optional but nicer
 reg add "HKLM\SOFTWARE\OpenSSH" /v DefaultShell /t REG_SZ /d "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" /f
 
-:: Smoke test from the NUC
+:: Smoke test from the NUC (before password login is disabled below)
 ssh <windows-user>@localhost
 ```
 
-### Key-based auth (strongly recommended)
+The built-in sshd firewall rule only covers the **Private** profile, so SSH is reachable over Tailscale but not from the home Wi-Fi (Public). That's intentional.
+
+### Key-based auth
 
 On your **laptop**:
 
@@ -112,17 +128,55 @@ ssh-keygen -t ed25519
 type %USERPROFILE%\.ssh\id_ed25519.pub
 ```
 
-Copy that pubkey. Then on the **NUC**:
+Copy the **whole line**, including the leading `ssh-ed25519 `. A line that starts with `AAAA...` (just the middle part) is silently ignored, and SSH falls back to asking for a password.
 
-If your Windows account is a standard user: append the key to `%USERPROFILE%\.ssh\authorized_keys` (create the file and `.ssh` folder if missing).
+Then on the **NUC**:
 
-If your Windows account is an administrator (check with `net localgroup Administrators`), Windows reads from a different file. In elevated cmd:
+If your Windows account is a standard user: put the key in `%USERPROFILE%\.ssh\authorized_keys` (create the file and `.ssh` folder if missing).
+
+If your Windows account is an administrator (check with `net localgroup Administrators`), sshd **only** reads `C:\ProgramData\ssh\administrators_authorized_keys` and ignores the per-user file. In elevated cmd:
 
 ```cmd
-echo <paste-pubkey-here> >> C:\ProgramData\ssh\administrators_authorized_keys
+echo <paste-the-whole-pubkey-line> > C:\ProgramData\ssh\administrators_authorized_keys
 icacls C:\ProgramData\ssh\administrators_authorized_keys /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F"
+```
+
+(`>` replaces the file; use `>>` to add a second key.) sshd re-reads the file on every login, so no restart is needed.
+
+Only Administrators and SYSTEM can read that file, so a non-elevated editor shows it as **empty**. To view or edit it, run `notepad C:\ProgramData\ssh\administrators_authorized_keys` from an elevated cmd.
+
+Test from the laptop with password auth disabled for that one connection:
+
+```cmd
+ssh -o PreferredAuthentications=publickey -o PasswordAuthentication=no <windows-user>@nuc.<tailnet>.ts.net whoami
+```
+
+Then on the NUC, confirm the login used the key. The event log should say `Accepted publickey` (not `Accepted password`):
+
+```cmd
+powershell -Command "Get-WinEvent -LogName OpenSSH/Operational -MaxEvents 50 | Where-Object { $_.Message -match 'Accepted' } | Select-Object -First 3 TimeCreated, Message"
+```
+
+### Disable password login
+
+Only after the key test passes. Do this while you're physically at the NUC, so you can undo it at the keyboard if something goes wrong.
+
+```cmd
+copy C:\ProgramData\ssh\sshd_config C:\ProgramData\ssh\sshd_config.bak
+notepad C:\ProgramData\ssh\sshd_config
+```
+
+Change `#PasswordAuthentication yes` to `PasswordAuthentication no` (remove the `#`), save, then:
+
+```cmd
 net stop sshd && net start sshd
 ```
+
+From the laptop, `ssh <windows-user>@nuc.<tailnet>.ts.net whoami` should log in without a password prompt, and `ssh -o PreferredAuthentications=password <windows-user>@nuc.<tailnet>.ts.net` should fail with `Permission denied (publickey...)`.
+
+To undo: `copy C:\ProgramData\ssh\sshd_config.bak C:\ProgramData\ssh\sshd_config`, then restart sshd.
+
+**With password login off, the laptop's key is the only way in over SSH.** Before replacing or reinstalling the laptop, add the new machine's key to `administrators_authorized_keys` (with `>>`) while the old one still works. Otherwise you'll need to be at the NUC.
 
 ## 4. Install Tailscale on the NUC
 
@@ -173,11 +227,44 @@ You can also run `claude` directly in the SSH session — Claude Code on the NUC
 
 | Task | How |
 |------|-----|
-| Ping the phone | `POST http://nuc.<tailnet>.ts.net:8000/ping` with `Authorization: Bearer <token>`, Tailscale connected. **`http`, not `https`** — uvicorn serves plain HTTP (Tailscale already encrypts the traffic). |
+| Ping the phone | The iPhone/Mac Shortcut ([below](#iphone--mac-shortcut)), or by hand: `POST http://nuc.<tailnet>.ts.net:8000/ping` with `Authorization: Bearer <token>`, Tailscale connected. **`http`, not `https`** — uvicorn serves plain HTTP (Tailscale already encrypts the traffic). |
 | Re-authenticate with Apple | `/ping` returns 401 → open `http://nuc.<tailnet>.ts.net:8000/icloud?token=<token>` and enter the code. It goes to the account's trusted devices (possibly the target phone itself). The browser keeps the token in a cookie for 30 days, so later visits can use plain `/icloud`. |
 | Deploy a code change | Edit over Remote-SSH, then in an elevated cmd: `net stop LocatorService && net start LocatorService`. Python only reads the code at startup — changes don't apply until restart. |
 | Watch logs | `locator.out.log` has the app's timestamped output: each request (IP, status, duration, User-Agent), init, target device, pings. `locator.err.log` has uvicorn startup/shutdown and tracebacks. |
 | Rotate the token | Update `LOCATOR_TOKEN` in both places (`setx /M` and `nssm set ... AppEnvironmentExtra`), restart the service, then update the Shelly URL and any Shortcuts. |
+
+### iPhone / Mac Shortcut
+
+A Shortcut keeps the URL and token so you never type them: tap it, say "Hey Siri, Ping Phone", or run it from the Mac. Build it once on the iPhone; iCloud syncs it to the Mac.
+
+In the **Shortcuts** app, tap **+**, add these actions in order, and name it **Ping Phone** (the name is the Siri phrase):
+
+1. **Connect to your Tailscale network** (an action from the Tailscale app). Lets the Shortcut work without Tailscale already on.
+2. **Get Contents of URL**
+   - URL: `http://nuc.<tailnet>.ts.net:8000/ping`. Type the `http://`; the service doesn't serve `https`.
+   - Tap the arrow to expand it:
+     - Method: **POST**
+     - Headers: key `Authorization`, value `Bearer <token>` (the word `Bearer`, a space, then the token)
+     - Request Body: leave empty
+3. **Get Dictionary Value**: Get **Value** for `status` in *Contents of URL*. A successful ping returns `{"status": "Ping sent to iPhone"}`; anything else (401 iCloud re-auth, 403 bad token) has no `status`.
+4. **If** *Dictionary Value* **has any value**
+   - **Show Result**: `Done, it's ringing`
+5. **Otherwise**
+   - **Show Result**: `Something went wrong.`
+6. **End If**
+7. **Disconnect from your Tailscale network** (optional, see below).
+
+**Show Result** is what Siri reads out loud when you run it by voice; run any other way, it's a quiet banner. Use **Speak Text** instead if you want it spoken every time.
+
+**Ways to run it:**
+- iPhone: Siri, a home screen icon or widget, **Back Tap** (Settings → Accessibility → Touch → Back Tap), a Control Center button (iOS 18+), or the Action Button.
+- Mac: Spotlight ("Ping Phone"), the menu bar, a keyboard shortcut set in the Shortcut's details, or Terminal: `shortcuts run "Ping Phone"`.
+
+**Things to know:**
+- **The token sits in the Shortcut in plain text.** Never share it with "Copy iCloud Link": that uploads it, token included, to Apple, and anyone with the link can ring the phone. If you rotate the token, edit the header in one place; it syncs.
+- **The disconnect step turns Tailscale off even if it was on before you ran the Shortcut.** Drop step 7 if you normally leave Tailscale connected. And if the request itself errors (NUC down, no network), the Shortcut stops there with Siri's generic "problem running the shortcut", so step 7 never runs and Tailscale stays connected.
+- **"Something went wrong."** most often means iCloud needs re-authentication (`/ping` returned 401): open `http://nuc.<tailnet>.ts.net:8000/icloud`. If that page says no verification is needed, check the token in the header instead (a 403 in `locator.out.log`).
+- Expect a few seconds before the result: the service replies only after Apple accepts the ping.
 
 ### Gotchas
 
@@ -199,15 +286,26 @@ All verified on the NUC:
 - [x] BIOS **After Power Failure → Power On** (NUC powers up by itself when plugged in)
 - [x] Unplug → replug → no login → `/ping` from laptop works
 
-### If it stops working when away from home
+### Security state — checklist
 
-If `/ping` works on home Wi-Fi but times out over Tailscale from elsewhere, Windows Firewall is likely blocking it:
+All verified on the NUC:
+
+- [x] Every endpoint requires `LOCATOR_TOKEN`. FastAPI's `/docs`, `/redoc` and `/openapi.json` are disabled.
+- [x] SSH: key-only (`PasswordAuthentication no`), and reachable only over Tailscale (sshd rule is Private-profile only)
+- [x] Firewall: only `Phone Pinger (TCP 8000)` admits traffic to the service, from `localsubnet` + Tailscale ranges. No blanket `python.exe` rules.
+- [x] Dependencies pinned in `requirements.txt`
+
+### If it stops working
+
+Something answers on home Wi-Fi but not over Tailscale, or the other way round: check the firewall rule (step 2) is still there and enabled:
 
 ```cmd
-netsh advfirewall firewall add rule name="Locator 8000" dir=in action=allow protocol=TCP localport=8000
+netsh advfirewall firewall show rule name="Phone Pinger (TCP 8000)"
 ```
 
-Test by using your phone on cellular (Wi-Fi off, Tailscale on).
+Then test from your phone on cellular (Wi-Fi off, Tailscale on), and from a device on the home Wi-Fi with Tailscale off.
+
+A `403` in `locator.out.log` means the request reached the app but the token was missing or wrong. That's not the firewall. Check the Shelly URL or Shortcut has `?token=` / the `Authorization` header with the current `LOCATOR_TOKEN`.
 
 ### Optional housekeeping
 
@@ -216,7 +314,6 @@ Test by using your phone on cellular (Wi-Fi off, Tailscale on).
   C:\tools\nssm.exe set LocatorService AppRotateFiles 1
   C:\tools\nssm.exe set LocatorService AppRotateBytes 1048576
   ```
-- **One-tap button:** iOS Shortcut → "Get contents of URL" → `http://nuc.<tailnet>.ts.net:8000/ping`, Method **POST**, header `Authorization: Bearer <token>`. Requires Tailscale on the phone.
 
 ## Pitfalls
 
@@ -224,5 +321,6 @@ Test by using your phone on cellular (Wi-Fi off, Tailscale on).
 - **NSSM `ObjectName` password**: stored encrypted in LSA secrets, not plaintext — but if you change your Windows password, re-run the `set ObjectName` command.
 - **Keep `--host 0.0.0.0`**: the Shelly button reaches the service over the LAN at `<nuc-lan-ip>:8000` (see README). Binding to the Tailscale IP alone would break the button.
 - **2FA re-prompts**: Apple invalidates sessions periodically. The `/icloud` endpoint handles this, but you need to be reachable on Tailscale to use it from off-LAN.
-- **Access denied running `nssm set` / `sc` / `setx /M` / `dism`**: the shell isn't elevated. These all need Administrator.
+- **Access denied running `nssm set` / `sc` / `setx /M` / `dism` / `netsh advfirewall`**: the shell isn't elevated. These all need Administrator.
+- **"Allow Python through the firewall?" popup**: click Cancel. See the firewall section in step 2.
 - **`setx` doesn't update the current shell**: after step 1, open a fresh Command Prompt before continuing.
